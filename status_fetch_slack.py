@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import datetime
 
 from flask import Flask, abort, request, jsonify
@@ -61,6 +62,10 @@ app = Flask(__name__)
 
 SLACK_SIGNING_SECRET: str | None = os.getenv("SLACK_SIGNING_SECRET")
 PORT: int = int(os.getenv("PORT", 5000))
+
+# ── In-memory event log (last 100 events) ─────────────────────────────────────
+# Stored as dicts so they can be rendered in the public /logs page.
+EVENT_LOG: deque = deque(maxlen=100)
 
 # ── API component filter ───────────────────────────────────────────────────────
 # Exact component names from https://status.openai.com → "APIs" group (12 total).
@@ -232,7 +237,7 @@ def parse_statuspage_message(text: str) -> dict:
 
 
 def log_api_event(parsed: dict) -> None:
-    """Print a formatted API status event to the console."""
+    """Print a formatted API status event to the console and store it."""
     sep = "=" * 55
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -247,6 +252,16 @@ def log_api_event(parsed: dict) -> None:
         print(f"  Details   : {parsed['body']}")
     print(sep)
 
+    # Store event for the public /logs page.
+    EVENT_LOG.appendleft({
+        "timestamp": ts,
+        "component": parsed["component"] or "Unknown",
+        "status": parsed["status"] or "Unknown",
+        "severity": parsed["severity"] or "Unknown",
+        "headline": parsed["headline"],
+        "body": parsed["body"],
+    })
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -254,6 +269,77 @@ def log_api_event(parsed: dict) -> None:
 def health():
     """Liveness probe."""
     return jsonify({"status": "ok", "service": "openai-api-status-monitor"}), 200
+
+
+@app.route("/logs", methods=["GET"])
+def public_logs():
+    """
+    Public read-only view of received API status events.
+    Auto-refreshes every 30 s. No authentication required.
+    """
+    severity_colors = {
+        "Resolved": "#22c55e",
+        "Degraded / Minor": "#eab308",
+        "Partial Outage": "#f97316",
+        "Major Outage": "#ef4444",
+        "Maintenance": "#3b82f6",
+        "Informational": "#6b7280",
+        "Unknown": "#6b7280",
+    }
+
+    rows = ""
+    for e in EVENT_LOG:
+        color = severity_colors.get(e["severity"], "#6b7280")
+        rows += f"""
+        <tr>
+          <td>{e['timestamp']}</td>
+          <td>{e['component']}</td>
+          <td><span style="color:{color};font-weight:600">{e['status']}</span></td>
+          <td><span style="color:{color};font-weight:600">{e['severity']}</span></td>
+          <td>{e['headline']}</td>
+          <td>{e['body'] or '—'}</td>
+        </tr>"""
+
+    if not rows:
+        rows = '<tr><td colspan="6" style="text-align:center;color:#888">No events received yet.</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="30">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenAI API Status Monitor — Live Logs</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }}
+    h1   {{ font-size: 1.4rem; margin-bottom: 4px; }}
+    p    {{ color: #94a3b8; font-size: 0.85rem; margin: 0 0 20px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+    th   {{ background: #1e293b; padding: 10px 14px; text-align: left;
+            color: #94a3b8; font-weight: 600; border-bottom: 1px solid #334155; }}
+    td   {{ padding: 10px 14px; border-bottom: 1px solid #1e293b; vertical-align: top; }}
+    tr:hover td {{ background: #1e293b; }}
+    .badge {{ display:inline-block; padding:2px 8px; border-radius:999px;
+              background:#1e293b; font-size:0.75rem; }}
+  </style>
+</head>
+<body>
+  <h1>🔔 OpenAI API Status Monitor — Live Logs</h1>
+  <p>Showing last {len(EVENT_LOG)} event(s). Page auto-refreshes every 30 s.
+     Only API-group events are shown (Chat Completions, Embeddings, Audio, etc.)</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th><th>Component</th><th>Status</th>
+        <th>Severity</th><th>Headline</th><th>Details</th>
+      </tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/slack/events", methods=["POST"])
